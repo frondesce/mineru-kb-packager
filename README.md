@@ -195,6 +195,10 @@ In general, do not re-chunk this file with a fixed sliding window unless your sy
 - `SKILL.md`: internal skill-oriented workflow notes
 - `README.md`: public project overview
 
+## Community
+
+Special thanks to the community for their support and contributions: https://linux.do/ 
+
 ## License
 
 MIT
