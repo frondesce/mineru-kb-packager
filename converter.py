@@ -78,7 +78,8 @@ class MinerUConverter:
     # 正式图编号模式
     FIGURE_NUMBER_PATTERN = r'(Figure|Fig\.?|图)\s*\d+[\w\-\.]*'
 
-    def __init__(self, input_dir: str, output_dir: Optional[str] = None):
+    def __init__(self, input_dir: str, output_dir: Optional[str] = None,
+                 shared_output_dir: Optional[str] = None):
         self.input_dir = Path(input_dir).resolve()
         self.project_root = Path.cwd().resolve()
 
@@ -91,6 +92,9 @@ class MinerUConverter:
             self.output_dir = Path(output_dir).resolve()
         else:
             self.output_dir = self.input_dir / "output"
+
+        # 共享输出目录（汇集所有文档的 kb_chunks）
+        self.shared_output_dir = Path(shared_output_dir).resolve() if shared_output_dir else None
 
         # 统计数据
         self.stats = {
@@ -1290,6 +1294,25 @@ class MinerUConverter:
                 f.write(json.dumps(minimal_chunk, ensure_ascii=False) + "\n")
 
         print(f"已生成: {jsonl_path}")
+
+        # 写入共享输出目录（以文档名命名）
+        if self.shared_output_dir:
+            self.shared_output_dir.mkdir(parents=True, exist_ok=True)
+            shared_path = self.shared_output_dir / f"{self.doc_title}.jsonl"
+            with open(shared_path, "w", encoding="utf-8") as f:
+                for chunk in self.chunks:
+                    section_title = self.clean_section_title(chunk["section_title"])
+                    minimal_chunk = {
+                        "chunk_id": chunk["chunk_id"],
+                        "page_no": chunk["page_no"],
+                        "content_type": chunk["content_type"],
+                        "section_title": section_title,
+                        "chunk_text": chunk["chunk_text"],
+                        "image_path": chunk["image_path"],
+                    }
+                    f.write(json.dumps(minimal_chunk, ensure_ascii=False) + "\n")
+            print(f"已生成 (共享): {shared_path}")
+
         return jsonl_path
 
     def write_manifest(self):
@@ -1554,10 +1577,16 @@ def main():
         "-o",
         help="输出目录路径（默认: <input_dir>/output）"
     )
+    parser.add_argument(
+        "--shared-output",
+        "-s",
+        help="共享输出目录路径，将 kb_chunks 以文档名命名汇集到此目录"
+    )
 
     args = parser.parse_args()
 
-    converter = MinerUConverter(args.input_dir, args.output_dir)
+    converter = MinerUConverter(args.input_dir, args.output_dir,
+                                shared_output_dir=args.shared_output)
     converter.convert()
 
 

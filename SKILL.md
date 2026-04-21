@@ -22,7 +22,7 @@ Transform MinerU PDF parsing output into a retrieval-ready knowledge base packag
 ### Usage
 
 ```bash
-python3 converter.py <input_dir> [--output-dir <output_dir>]
+python3 converter.py <input_dir> [--output-dir <output_dir>] [--shared-output <shared_dir>]
 ```
 
 ### Example
@@ -33,6 +33,11 @@ python3 converter.py ./mineru_output/my_document.pdf-uuid
 
 # With custom output directory
 python3 converter.py ./mineru_output/my_document.pdf-uuid --output-dir ./kb_chunks/
+
+# Batch processing with shared output (collects all kb_chunks into one directory, named by document)
+python3 converter.py ./dir1 -s ./output/
+python3 converter.py ./dir2 -s ./output/
+# Produces: output/my_document_1.jsonl, output/my_document_2.jsonl
 ```
 
 ### Output Files
