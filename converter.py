@@ -29,6 +29,8 @@ class MinerUConverter:
         "list": "text",
         "table": "table",
         "image": "figure",
+        "chart": "figure",
+        "code": "text",
         "equation_interline": "formula",
         "title": "title",
         "page_header": "noise",
@@ -142,18 +144,27 @@ class MinerUConverter:
         # 页块缓存: page_no -> [(idx, type, text, section_title), ...]
         self.page_blocks_cache = {}
 
+    def _normalize_document_name(self, dirname: str) -> str:
+        """Remove MinerU transport suffixes while preserving the source name."""
+        base = re.sub(
+            r'-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$',
+            '',
+            dirname,
+            flags=re.IGNORECASE,
+        )
+        base = re.sub(r'-mineru$', '', base, flags=re.IGNORECASE)
+        base = re.sub(r'\.pdf$', '', base, flags=re.IGNORECASE)
+        return base
+
     def _generate_doc_id(self, dirname: str) -> str:
         """生成稳定的 doc_id"""
-        base = re.sub(r'-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', '', dirname)
-        base = re.sub(r'\.pdf$', '', base)
-        hash_suffix = hashlib.md5(dirname.encode()).hexdigest()[:8]
+        base = self._normalize_document_name(dirname)
+        hash_suffix = hashlib.md5(base.encode()).hexdigest()[:8]
         return f"{base}_{hash_suffix}"
 
     def _extract_doc_title(self, dirname: str) -> str:
         """提取文档标题"""
-        base = re.sub(r'-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', '', dirname)
-        base = re.sub(r'\.pdf$', '', base)
-        return base
+        return self._normalize_document_name(dirname)
 
     def _get_relative_path(self, path: Path) -> str:
         """获取相对于项目根目录的路径"""
@@ -468,10 +479,11 @@ class MinerUConverter:
         image_source = content.get("image_source", {})
         image_path = image_source.get("path", "")
 
-        caption = content.get("image_caption", [])
+        content_prefix = "chart" if block.get("type") == "chart" else "image"
+        caption = content.get(f"{content_prefix}_caption", [])
         caption_text = self.extract_text_from_content(caption)
 
-        footnote = content.get("image_footnote", [])
+        footnote = content.get(f"{content_prefix}_footnote", [])
         footnote_text = self.extract_text_from_content(footnote)
 
         texts = []
@@ -777,7 +789,7 @@ class MinerUConverter:
                     continue
 
                 # 跳过低价值章节中的内容
-                if self.skip_current_section and block_type in ["paragraph", "list", "table"]:
+                if self.skip_current_section and block_type in ["paragraph", "list", "table", "code"]:
                     self.error_report["skipped_blocks"].append({
                         "block_id": f"p{page_no}_b{block_index}",
                         "type": block_type,
@@ -822,8 +834,13 @@ class MinerUConverter:
                     continue
 
                 # 处理图片
-                if block_type == "image":
+                if block_type in ["image", "chart"]:
                     self._process_image_block(block, page_no, block_idx, block_index)
+                    continue
+
+                # 代码块保留为可检索文本，避免扩大 JSONL content_type 集合
+                if block_type == "code":
+                    self._process_code_block(block, page_no, block_index)
                     continue
 
                 # 处理行间公式
@@ -859,6 +876,7 @@ class MinerUConverter:
                 "section_path": section_path,
                 "block_bbox": item.get("bbox", []),
                 "merge_from_block_ids": item.get("merge_from_block_ids", []),
+                "source_type": item.get("source_type", "text"),
                 "cleanup_flags": [],
                 "parser": "MinerU-postprocessed",
             }
@@ -967,6 +985,7 @@ class MinerUConverter:
     def _process_image_block(self, block: dict, page_no: int, block_idx: int, block_index: int):
         """处理图片块 - 支持正式图、子图碎片、弱图块的分级处理"""
         image_path_raw, image_text, caption_text = self.extract_image_info(block)
+        source_type = block.get("type", "image")
 
         full_image_path = None
         relative_image_path = ""
@@ -979,7 +998,7 @@ class MinerUConverter:
                 self.error_report["missing_images"].append({
                     "block_id": f"p{page_no}_b{block_index}",
                     "expected_path": str(image_path_raw),
-                    "type": "figure",
+                    "type": source_type,
                 })
                 self.stats["missing_images"] += 1
 
@@ -989,22 +1008,30 @@ class MinerUConverter:
         nearby_text = self.find_nearby_text(page_no, block_idx, section_title)
 
         texts = []
-        if caption_text:
-            texts.append(f"Figure: {caption_text}")
+        if image_text:
+            texts.append(image_text)
         if nearby_text:
             texts.append(f"Context: {nearby_text}")
 
         chunk_text = "\n".join(texts) if texts else "Figure (see image)"
 
         # 对 figure chunk 进行分类
-        figure_type = self._classify_figure_chunk(caption_text, nearby_text, chunk_text)
+        if source_type == "chart" and relative_image_path:
+            # MinerU may split one chart into several image blocks while keeping
+            # the full caption in a neighboring title block. Every chart image
+            # is meaningful even when its own caption is short or empty.
+            figure_type = "formal"
+        else:
+            figure_type = self._classify_figure_chunk(
+                caption_text, nearby_text, chunk_text
+            )
 
         # 1. 弱图块：直接跳过
         if figure_type == 'weak':
             self.stats["skipped_weak_figures"] += 1
             self.error_report["skipped_blocks"].append({
                 "block_id": f"p{page_no}_b{block_index}",
-                "type": "image",
+                "type": source_type,
                 "reason": "weak figure chunk skipped (insufficient caption or context)",
                 "page_no": page_no,
                 "caption": caption_text[:100] if caption_text else "",
@@ -1036,7 +1063,7 @@ class MinerUConverter:
                 self.stats["skipped_weak_figures"] += 1
                 self.error_report["skipped_blocks"].append({
                     "block_id": f"p{page_no}_b{block_index}",
-                    "type": "image",
+                    "type": source_type,
                     "reason": "subfigure fragment skipped (no parent figure found)",
                     "page_no": page_no,
                     "caption": caption_text[:100] if caption_text else "",
@@ -1082,6 +1109,35 @@ class MinerUConverter:
         self.chunks.append(chunk)
         self.stats["figure_chunks"] += 1
         self.stats["total_chunks"] += 1
+
+    def _process_code_block(self, block: dict, page_no: int, block_index: int):
+        """Preserve MinerU V2 code blocks as searchable text chunks."""
+        content = block.get("content", {})
+        caption = self.extract_text_from_content(content.get("code_caption", []))
+        code_text = self.extract_text_from_content(content.get("code_content", [])).strip()
+        language = str(content.get("code_language") or "").strip()
+
+        if not code_text:
+            self.error_report["parse_errors"].append({
+                "block_id": f"p{page_no}_b{block_index}",
+                "type": "code",
+                "error": "Empty code content",
+            })
+            return
+
+        texts = [f"Code: {caption}" if caption else "Code:"]
+        if language and language.lower() not in {"text", "txt", "plain", "plaintext"}:
+            texts.append(f"Language: {language}")
+        texts.append(code_text)
+        self._add_text_chunk({
+            "type": "text",
+            "text": "\n".join(texts),
+            "page_no": page_no,
+            "section_title": self.current_section_title,
+            "source_block_id": f"p{page_no}_b{block_index}",
+            "bbox": block.get("bbox", []),
+            "source_type": "code",
+        })
 
     def _process_formula_block(self, block: dict, page_no: int, block_index: int):
         """处理公式块"""
@@ -1151,7 +1207,10 @@ class MinerUConverter:
         suffix_counter = defaultdict(int)
 
         for chunk in self.chunks:
-            if chunk["content_type"] == "text":
+            if (
+                chunk["content_type"] == "text"
+                and chunk.get("metadata", {}).get("source_type") != "code"
+            ):
                 text = chunk["chunk_text"]
                 prefix = text[:50].strip()
                 suffix = text[-50:].strip()
@@ -1164,7 +1223,10 @@ class MinerUConverter:
         common_suffixes = {s for s, c in suffix_counter.items() if c > 3}
 
         for chunk in self.chunks:
-            if chunk["content_type"] == "text":
+            if (
+                chunk["content_type"] == "text"
+                and chunk.get("metadata", {}).get("source_type") != "code"
+            ):
                 text = chunk["chunk_text"]
 
                 for prefix in common_prefixes:
@@ -1421,6 +1483,8 @@ class MinerUConverter:
 | `list` | `text` | 列表，可合并 |
 | `table` | `table` | 表格，支持按行拆分 |
 | `image` | `figure` | 图片，结合邻近正文生成描述 |
+| `chart` | `figure` | 图表，保留图片、标题和图注 |
+| `code` | `text` | 代码或时序文本，原文保留为可检索文本 |
 | `equation_interline` | `formula` | 行间公式 |
 | `title` | - | 用于章节追踪，不输出 |
 | `page_header/footer/number` | - | 当作噪音跳过 |
