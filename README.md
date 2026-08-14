@@ -16,13 +16,16 @@ It uploads one or more PDFs, waits for MinerU parsing, downloads the complete st
 - Batch upload and processing for multiple PDFs
 - Live page progress when MinerU provides it, with a heartbeat during long waits
 - Automatic retry when a completed result Zip is temporarily unavailable
+- Offline `--convert-only` recovery without another upload or API token
 - Structured-source processing based on `content_list_v2.json`
 - Semantic chunking for paragraphs, lists, tables, figures, charts, code, and formulas
-- Long-table splitting with repeated captions and headers
+- Attribute-aware HTML table parsing, including `rowspan` and `colspan`
+- Lossless long-table splitting with repeated captions and headers and a hard chunk cap
 - Figure and chart enrichment using nearby document text
-- Filtering for page furniture, empty blocks, contents pages, and revision-history sections
+- Structural filtering for page furniture, empty blocks, contents pages, and revision-history sections
+- Preservation of technical/legal page footnotes, repeated normative text, and every figure/chart block
 - Minimal six-field JSONL output for RAG ingestion
-- Manifest, validation, and error reporting
+- Atomic local/shared publication with manifest, validation, and error reporting
 
 ## Requirements
 
@@ -68,6 +71,19 @@ python3 acquire_mineru.py /path/to/pdf-directory \
   --shared-output /path/to/knowledge-base/output
 ```
 
+If acquisition succeeded but conversion failed, reuse every existing `*-mineru`
+directory under the result root without setting `MINERU_TOKEN`:
+
+```bash
+python3 acquire_mineru.py \
+  --convert-only \
+  --output-root /path/to/knowledge-base \
+  --shared-output /path/to/knowledge-base/output
+```
+
+You can also pass the original PDF paths with `--convert-only` to select only
+their computed result directories.
+
 ## Parsing Options
 
 The defaults are optimized for English technical documents:
@@ -101,7 +117,7 @@ python3 acquire_mineru.py --help
 - Each PDF is checked locally against MinerU's 200 MB file-size limit.
 - MinerU enforces its page-count limit and returns an explicit API error when a file exceeds it.
 - PDF splitting is intentionally not automated; split large documents at meaningful semantic boundaries before running the package.
-- Existing result directories are never overwritten or reused. Move them or choose another `--output-root` before rerunning the same PDF.
+- Normal acquisition never overwrites or reuses an existing result directory. Use `--convert-only` explicitly to rebuild validated KB output from an existing structured result.
 - Downloaded Zip files are checked for path traversal, symbolic links, abnormal expansion, and required structured content.
 
 ## Output
@@ -143,6 +159,11 @@ Each line in `kb_chunks.jsonl` contains exactly six fields:
 
 `content_type` is one of `text`, `table`, `figure`, or `formula`. MinerU `chart` blocks become figures, while `code` blocks are preserved as searchable text.
 
+`page_footnote` blocks are preserved as text. Page furniture is removed only
+when MinerU labels it structurally as a header, footer, page number, or aside;
+repeated body text is never deleted by lexical heuristics. Short text blocks are
+merged only when both page and section context match.
+
 For ingestion, use `chunk_text` as the content field and the remaining fields as metadata. Avoid applying another fixed sliding-window split unless the downstream system requires it.
 
 ## Processing and Validation
@@ -155,7 +176,11 @@ The run reports success only when:
 - `kb_chunks.jsonl` is non-empty and every chunk has the expected schema;
 - every `chunk_text` is non-empty;
 - every non-empty `image_path` resolves to an existing file;
-- the converter reports no unsupported MinerU block types or parse errors.
+- no chunk exceeds the converter's hard size cap;
+- the converter reports no missing figure/chart sources, unsupported MinerU block types, parse errors, or oversized table chunks.
+
+Local files are written atomically. When `--shared-output` is used, the shared
+JSONL is published last, only after the in-memory package has passed validation.
 
 The generated `error_report.json` still records intentionally skipped noise and empty placeholder blocks for inspection.
 

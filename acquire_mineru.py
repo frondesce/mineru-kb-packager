@@ -365,6 +365,34 @@ def build_jobs(pdf_paths: Sequence[Path], output_root: Optional[Path]) -> List[J
     return jobs
 
 
+def discover_existing_jobs(output_root: Optional[Path]) -> List[Job]:
+    """Build convert-only jobs by scanning an existing result root."""
+    if output_root is None:
+        raise MinerUError("省略 PDF 输入时，--convert-only 必须同时指定 --output-root")
+    if not output_root.is_dir():
+        raise MinerUError(f"MinerU 结果根目录不存在: {output_root}")
+
+    result_dirs = sorted(
+        path for path in output_root.iterdir()
+        if path.is_dir() and path.name.endswith("-mineru")
+    )
+    if not result_dirs:
+        raise MinerUError(f"{output_root}: 没有找到 *-mineru 结果目录")
+
+    jobs = []
+    for result_dir in result_dirs:
+        source_name = result_dir.name[:-len("-mineru")]
+        jobs.append(
+            Job(
+                source_pdf=output_root / source_name,
+                data_id="",
+                result_dir=result_dir,
+                project_root=output_root,
+            )
+        )
+    return jobs
+
+
 def chunks(values: Sequence[Job], size: int) -> Iterable[Sequence[Job]]:
     for index in range(0, len(values), size):
         yield values[index:index + size]
@@ -553,6 +581,8 @@ def validate_kb_output(job: Job) -> None:
 
     unsupported = error_report.get("unsupported_blocks") or []
     parse_errors = error_report.get("parse_errors") or []
+    missing_images = error_report.get("missing_images") or []
+    oversized_tables = error_report.get("oversized_table_chunks") or []
     if unsupported:
         counts: Dict[str, int] = {}
         for block in unsupported:
@@ -569,6 +599,14 @@ def validate_kb_output(job: Job) -> None:
     if parse_errors:
         raise MinerUError(
             f"{job.source_pdf.name}: 转换报告了 {len(parse_errors)} 个解析错误"
+        )
+    if missing_images:
+        raise MinerUError(
+            f"{job.source_pdf.name}: 转换报告了 {len(missing_images)} 个缺失图片"
+        )
+    if oversized_tables:
+        raise MinerUError(
+            f"{job.source_pdf.name}: 转换报告了 {len(oversized_tables)} 个超长表格分块"
         )
 
 
@@ -615,8 +653,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "inputs",
-        nargs="+",
-        help="一个或多个 PDF；目录输入会处理该目录第一层的所有 *.pdf",
+        nargs="*",
+        help=(
+            "一个或多个 PDF；目录输入会处理该目录第一层的所有 *.pdf；"
+            "--convert-only 配合 --output-root 时可省略"
+        ),
     )
     parser.add_argument(
         "--output-root",
@@ -637,6 +678,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--ocr", action="store_true", help="强制启用 OCR")
     parser.add_argument("--disable-table", action="store_true", help="关闭表格识别")
     parser.add_argument("--disable-formula", action="store_true", help="关闭公式识别")
+    parser.add_argument(
+        "--convert-only",
+        action="store_true",
+        help="复用已存在的 *-mineru 结果，仅重新转换和校验，不访问 MinerU API",
+    )
     parser.add_argument(
         "--poll-interval",
         type=float,
@@ -662,19 +708,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if args.poll_interval <= 0 or args.timeout <= 0:
             raise MinerUError("--poll-interval 和 --timeout 必须大于 0")
-        pdf_paths = expand_pdf_inputs(args.inputs)
         output_root = args.output_root.expanduser().resolve() if args.output_root else None
         shared_output = args.shared_output.expanduser().resolve() if args.shared_output else None
-        if output_root:
+        if args.convert_only and not args.inputs:
+            jobs = discover_existing_jobs(output_root)
+        else:
+            if not args.inputs:
+                raise MinerUError("请提供至少一个 PDF 或包含 PDF 的目录")
+            pdf_paths = expand_pdf_inputs(args.inputs)
+            jobs = build_jobs(pdf_paths, output_root)
+        if output_root and not args.convert_only:
             output_root.mkdir(parents=True, exist_ok=True)
-        jobs = build_jobs(pdf_paths, output_root)
-
-        for job in jobs:
-            if job.result_dir.exists():
-                raise MinerUError(
-                    f"目标目录已存在，拒绝覆盖或复用: {job.result_dir}；"
-                    "请更换 --output-root 或先自行处理该目录"
-                )
 
         settings = {
             "model_version": args.model,
@@ -683,20 +727,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "enable_table": not args.disable_table,
             "enable_formula": not args.disable_formula,
         }
-        token = os.environ.get("MINERU_TOKEN", "").strip()
-        if not token:
-            raise MinerUError(
-                "未设置 MINERU_TOKEN；请在运行前配置该环境变量"
-            )
-        failures = process_new_jobs(
-            jobs,
-            token,
-            settings,
-            args.poll_interval,
-            args.timeout,
-        )
+        failures = []
+        if args.convert_only:
+            installed = []
+            for job in jobs:
+                if not job.result_dir.is_dir():
+                    failures.append(
+                        f"{job.source_pdf.name}: MinerU 结果目录不存在: {job.result_dir}"
+                    )
+                    continue
+                try:
+                    validate_result_dir(job.result_dir)
+                    installed.append(job)
+                except MinerUError as exc:
+                    failures.append(f"{job.source_pdf.name}: {exc}")
+        else:
+            for job in jobs:
+                if job.result_dir.exists():
+                    raise MinerUError(
+                        f"目标目录已存在，拒绝覆盖或复用: {job.result_dir}；"
+                        "转换失败后的已有结果请使用 --convert-only"
+                    )
+            token = os.environ.get("MINERU_TOKEN", "").strip()
+            if not token:
+                raise MinerUError(
+                    "未设置 MINERU_TOKEN；请在运行前配置该环境变量"
+                )
+            failures.extend(process_new_jobs(
+                jobs,
+                token,
+                settings,
+                args.poll_interval,
+                args.timeout,
+            ))
+            installed = [job for job in jobs if job.result_dir.exists()]
 
-        installed = [job for job in jobs if job.result_dir.exists()]
         completed = []
         for job in installed:
             try:

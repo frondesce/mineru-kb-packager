@@ -14,10 +14,81 @@ import os
 import re
 import hashlib
 import argparse
+import tempfile
+import sys
+from html.parser import HTMLParser
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Optional
-from collections import defaultdict
+from typing import Optional
+
+
+class ConverterError(RuntimeError):
+    """A conversion failure that should be shown without a traceback."""
+
+
+class _TableHTMLParser(HTMLParser):
+    """Parse MinerU table HTML while retaining cells with attributes and spans."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.rows = []
+        self._row = None
+        self._cell = None
+
+    @staticmethod
+    def _span(attrs: dict, name: str) -> int:
+        try:
+            return max(1, int(attrs.get(name, "1")))
+        except (TypeError, ValueError):
+            return 1
+
+    def handle_starttag(self, tag: str, attrs):
+        tag = tag.lower()
+        if tag == "tr":
+            self._finish_row()
+            self._row = []
+        elif tag in {"td", "th"}:
+            if self._row is None:
+                self._row = []
+            self._finish_cell()
+            values = dict(attrs)
+            self._cell = {
+                "parts": [],
+                "colspan": self._span(values, "colspan"),
+                "rowspan": self._span(values, "rowspan"),
+                "is_header": tag == "th",
+            }
+        elif tag == "br" and self._cell is not None:
+            self._cell["parts"].append("\n")
+
+    def handle_endtag(self, tag: str):
+        tag = tag.lower()
+        if tag in {"td", "th"}:
+            self._finish_cell()
+        elif tag == "tr":
+            self._finish_row()
+
+    def handle_data(self, data: str):
+        if self._cell is not None:
+            self._cell["parts"].append(data)
+
+    def _finish_cell(self):
+        if self._cell is None:
+            return
+        text = re.sub(r"\s+", " ", "".join(self._cell.pop("parts"))).strip()
+        self._cell["text"] = text
+        self._row.append(self._cell)
+        self._cell = None
+
+    def _finish_row(self):
+        self._finish_cell()
+        if self._row:
+            self.rows.append(self._row)
+        self._row = None
+
+    def finish(self):
+        self._finish_row()
+        return self.rows
 
 
 class MinerUConverter:
@@ -32,6 +103,7 @@ class MinerUConverter:
         "chart": "figure",
         "code": "text",
         "equation_interline": "formula",
+        "page_footnote": "text",
         "title": "title",
         "page_header": "noise",
         "page_footer": "noise",
@@ -50,8 +122,11 @@ class MinerUConverter:
     SKIP_SECTION_PATTERNS = [
         r'^\s*contents\s*$',
         r'^\s*table of contents\s*$',
+        r'^\s*figures\s*$',
         r'^\s*list of figures\s*$',
+        r'^\s*tables\s*$',
         r'^\s*list of tables\s*$',
+        r'^\s*index\s*$',
         r'^\s*rev\.\s*\w+',  # Rev. A, Rev. B 等
         r'^\s*revision\s*history\s*$',
         r'^\s*document\s*history\s*$',
@@ -137,6 +212,7 @@ class MinerUConverter:
         self.current_section_title = ""
         self.section_path = []
         self.skip_current_section = False
+        self.skip_section_level = None
 
         # 子图碎片合并：缓存最近的主图 chunk
         self.last_formal_figure = None  # 存储最近正式图的索引和相关信息
@@ -183,6 +259,61 @@ class MinerUConverter:
         ext = Path(path).suffix.lower()
         return ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']
 
+    def _resolve_image_path(
+        self,
+        image_path_raw: str,
+        block_id: str,
+        source_type: str,
+        *,
+        required: bool,
+    ) -> str:
+        """Resolve an image under the MinerU result root or report a fatal miss."""
+        if not image_path_raw:
+            if required:
+                self.error_report["missing_images"].append({
+                    "block_id": block_id,
+                    "expected_path": "",
+                    "type": source_type,
+                    "reason": "image block has no image source path",
+                })
+                self.stats["missing_images"] += 1
+            return ""
+        if not self._is_valid_image_path(image_path_raw):
+            if required:
+                self.error_report["missing_images"].append({
+                    "block_id": block_id,
+                    "expected_path": str(image_path_raw),
+                    "type": source_type,
+                    "reason": "unsupported image path or extension",
+                })
+                self.stats["missing_images"] += 1
+            return ""
+
+        candidate = (self.input_dir / image_path_raw).resolve()
+        try:
+            candidate.relative_to(self.input_dir)
+        except ValueError:
+            if required:
+                self.error_report["missing_images"].append({
+                    "block_id": block_id,
+                    "expected_path": str(image_path_raw),
+                    "type": source_type,
+                    "reason": "image path escapes MinerU result directory",
+                })
+                self.stats["missing_images"] += 1
+            return ""
+        if not candidate.is_file():
+            if required:
+                self.error_report["missing_images"].append({
+                    "block_id": block_id,
+                    "expected_path": str(image_path_raw),
+                    "type": source_type,
+                    "reason": "image file does not exist",
+                })
+                self.stats["missing_images"] += 1
+            return ""
+        return self._get_relative_path(candidate)
+
     def discover_files(self) -> dict:
         """发现并识别输入目录中的可用文件"""
         files_exist = {
@@ -205,7 +336,12 @@ class MinerUConverter:
                 break
 
         # 查找 content_list_v2.json (优先) 或带前缀的 *_content_list_v2.json
-        v2_candidates = list(self.input_dir.glob("*_content_list_v2.json"))
+        v2_candidates = sorted(self.input_dir.glob("*_content_list_v2.json"))
+        if len(v2_candidates) > 1:
+            self.error_report["parse_errors"].append({
+                "file": str(self.input_dir),
+                "error": "Multiple *_content_list_v2.json files found",
+            })
         if v2_candidates:
             files_exist["content_list_v2"] = v2_candidates[0]
             files_used["content_list_v2"] = v2_candidates[0]
@@ -248,7 +384,6 @@ class MinerUConverter:
         md_file = self.input_dir / "full.md"
         if md_file.exists():
             files_exist["full_md"] = md_file
-            files_used["full_md"] = md_file
 
         # 查找 images 目录
         images_dir = self.input_dir / "images"
@@ -277,17 +412,34 @@ class MinerUConverter:
                     "error": str(e),
                 })
 
+        if not isinstance(content_data, list):
+            self.error_report["parse_errors"].append({
+                "file": content_file.name if content_file else "content_list",
+                "error": "Top-level content list is not a page array",
+            })
+            return []
+        for page_index, page in enumerate(content_data, 1):
+            if not isinstance(page, list) or not all(isinstance(block, dict) for block in page):
+                self.error_report["parse_errors"].append({
+                    "file": content_file.name if content_file else "content_list",
+                    "page_no": page_index,
+                    "error": "Page is not an array of block objects",
+                })
+                return []
+
         return content_data
 
     def extract_text_from_content(self, content_items: list) -> str:
         """从内容项列表中提取纯文本"""
         texts = []
+        if not isinstance(content_items, list):
+            return ""
         for item in content_items:
             if isinstance(item, dict):
                 if item.get("type") == "text":
-                    texts.append(item.get("content", ""))
+                    texts.append(str(item.get("content", "")))
                 elif item.get("type") == "equation_inline":
-                    texts.append(item.get("content", ""))
+                    texts.append(str(item.get("content", "")))
         return "".join(texts)
 
     def extract_text_from_paragraph(self, block: dict) -> str:
@@ -315,6 +467,33 @@ class MinerUConverter:
         title_content = content.get("title_content", [])
         return self.extract_text_from_content(title_content)
 
+    def extract_page_footnote_text(self, block: dict) -> str:
+        """Extract semantic page footnotes instead of treating them as furniture."""
+        content = block.get("content", {})
+        return self.extract_text_from_content(content.get("page_footnote_content", []))
+
+    @staticmethod
+    def _compact_table_rows(raw_rows: list) -> list:
+        """Keep every non-empty cell and make rowspan/colspan semantics searchable."""
+        compact_rows = []
+        for raw_row in raw_rows:
+            row = []
+            for cell in raw_row:
+                text = str(cell.get("text", "")).strip()
+                if not text:
+                    continue
+                spans = []
+                if cell.get("colspan", 1) > 1:
+                    spans.append(f"colspan={cell['colspan']}")
+                if cell.get("rowspan", 1) > 1:
+                    spans.append(f"rowspan={cell['rowspan']}")
+                if spans:
+                    text = f"{text} [{', '.join(spans)}]"
+                row.append(text)
+            if row:
+                compact_rows.append(row)
+        return compact_rows
+
     def extract_table_data(self, block: dict) -> tuple:
         """提取表格数据，返回 (headers, rows, caption, footnote)"""
         content = block.get("content", {})
@@ -334,14 +513,13 @@ class MinerUConverter:
 
         if html:
             try:
-                html_rows = re.findall(r'<tr>(.*?)</tr>', html, re.DOTALL)
-                for i, row in enumerate(html_rows):
-                    cells = re.findall(r'<t[dh]>(.*?)</t[dh]>', row, re.DOTALL)
-                    cells = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
-                    if i == 0:
-                        headers = cells
-                    else:
-                        rows.append(cells)
+                parser = _TableHTMLParser()
+                parser.feed(str(html))
+                parsed_rows = self._compact_table_rows(parser.finish())
+                if not parsed_rows:
+                    raise ValueError("table HTML contains no rows")
+                headers = parsed_rows[0]
+                rows = parsed_rows[1:]
             except Exception as e:
                 self.error_report["parse_errors"].append({
                     "block_type": "table",
@@ -352,100 +530,80 @@ class MinerUConverter:
 
     def split_table_into_chunks(self, headers: list, rows: list, caption: str, footnote: str,
                                  page_no: int, block_index: int, image_path: str) -> list:
-        """将表格拆分成多个 chunks，确保每个 chunk 不超过 HARD_CAP_TOKENS"""
-        chunks = []
-
-        # 构建完整文本以计算总长度
-        texts = []
+        """Split tables without dropping cells and enforce the configured hard cap."""
+        prefix_lines = []
         if caption:
-            texts.append(f"Table: {caption}")
+            prefix_lines.append(f"Table: {caption}")
         if headers:
-            texts.append("Columns: " + " | ".join(headers))
-        for i, row in enumerate(rows, 1):
-            if row:
-                texts.append(f"Row {i}: " + " | ".join(row))
-        if footnote:
-            texts.append(f"Note: {footnote}")
+            prefix_lines.append("Columns: " + " | ".join(headers))
 
-        full_text = "\n".join(texts)
-        total_tokens = self.estimate_tokens(full_text)
+        row_lines = [
+            f"Row {index}: " + " | ".join(row)
+            for index, row in enumerate(rows, 1)
+            if row
+        ]
+        note_line = f"Note: {footnote}" if footnote else ""
+        full_text = "\n".join(prefix_lines + row_lines + ([note_line] if note_line else []))
+        if not full_text.strip() and image_path:
+            full_text = f"Table image: {Path(image_path).name}"
+        if len(full_text.strip()) <= 20 and not image_path:
+            return []
+        if self.estimate_tokens(full_text) <= self.HARD_CAP_TOKENS:
+            return [{
+                "text": full_text,
+                "is_split": False,
+                "split_index": 0,
+                "total_splits": 1,
+            }]
 
-        # 如果总长度未超限，不拆分
-        if total_tokens <= self.HARD_CAP_TOKENS:
-            is_valid = len(full_text.strip()) > 20
-            if is_valid:
-                chunks.append({
-                    "text": full_text,
-                    "is_split": False,
-                    "split_index": 0,
-                    "total_splits": 1
-                })
-            return chunks
+        # Reserve space for the final "Part X/Y" marker.
+        budget = self.HARD_CAP_TOKENS - 20
+        prefix_text = "\n".join(prefix_lines)
+        row_budget = max(50, budget - self.estimate_tokens(prefix_text))
+        drafts = []
+        current_rows = []
 
-        # 需要拆分 - 计算每行平均 token 数
-        avg_row_tokens = total_tokens // max(len(rows), 1)
+        def emit_current():
+            nonlocal current_rows
+            if current_rows:
+                drafts.append("\n".join(prefix_lines + current_rows))
+                current_rows = []
 
-        # 计算每个 chunk 能容纳的行数（保守估计，留出余量）
-        header_text = ""
-        if caption:
-            header_text += f"Table: {caption} (Part X/Y)\n"
-        if headers:
-            header_text += "Columns: " + " | ".join(headers)
-        header_tokens = self.estimate_tokens(header_text)
+        for row_line in row_lines:
+            candidate = "\n".join(prefix_lines + current_rows + [row_line])
+            if self.estimate_tokens(candidate) <= budget:
+                current_rows.append(row_line)
+                continue
 
-        # 每 chunk 可用 token 数（为脚注留余量）
-        available_tokens = self.HARD_CAP_TOKENS - header_tokens - 150  # 增加余量
-        rows_per_chunk = max(3, available_tokens // max(avg_row_tokens, 1))
+            emit_current()
+            if self.estimate_tokens("\n".join(prefix_lines + [row_line])) <= budget:
+                current_rows.append(row_line)
+                continue
 
-        # 使用动态调整确保每个 chunk 都不超限
-        # 注意：如果单行本身超长，为保语义完整，不强行截断，仅记录
-        current_row = 0
-        chunk_index = 0
+            # A single logical row may be very wide. Split its text without
+            # truncation and repeat the table title/header for every part.
+            for row_part in self.split_long_text(row_line, row_budget):
+                drafts.append("\n".join(prefix_lines + [row_part]))
 
-        while current_row < len(rows):
-            chunk_index += 1
-            chunk_rows = []
-            chunk_tokens = header_tokens
+        emit_current()
 
-            # 尽可能多地添加行，但不超过限制
-            for i in range(current_row, len(rows)):
-                row_text = f"Row {i + 1}: " + " | ".join(rows[i]) if rows[i] else ""
-                row_tokens = self.estimate_tokens(row_text)
-
-                # 留出余量给脚注
-                margin = 100 if (footnote and i == len(rows) - 1) else 50
-
-                if chunk_tokens + row_tokens > self.HARD_CAP_TOKENS - margin and chunk_rows:
-                    break
-
-                chunk_rows.append(rows[i])
-                chunk_tokens += row_tokens
-
-            if not chunk_rows:
-                # 单行就超限的情况，为保语义完整，单独成行
-                chunk_rows = [rows[current_row]]
-                current_row += 1
+        if note_line:
+            if drafts and self.estimate_tokens(drafts[-1] + "\n" + note_line) <= budget:
+                drafts[-1] += "\n" + note_line
             else:
-                current_row += len(chunk_rows)
+                for note_part in self.split_long_text(note_line, row_budget):
+                    drafts.append("\n".join(prefix_lines + [note_part]))
 
-            # 构建 chunk 文本
-            texts = []
-            if caption:
-                texts.append(f"Table: {caption} (Part {chunk_index}/{max(2, (len(rows) + len(chunk_rows) - 1) // len(chunk_rows))})")
-            if headers:
-                texts.append("Columns: " + " | ".join(headers))
-
-            for i, row in enumerate(chunk_rows, current_row - len(chunk_rows) + 1):
-                if row:
-                    texts.append(f"Row {i}: " + " | ".join(row))
-
-            # 只在最后一个 chunk 添加脚注
-            if current_row >= len(rows) and footnote:
-                texts.append(f"Note: {footnote}")
-
-            chunk_text = "\n".join(texts)
-
-            # 验证 chunk 长度
+        chunks = []
+        total_splits = len(drafts)
+        for index, draft in enumerate(drafts, 1):
+            lines = draft.splitlines()
+            marker = f"(Part {index}/{total_splits})"
+            if lines and lines[0].startswith("Table: "):
+                lines[0] = f"{lines[0]} {marker}"
+            else:
+                lines.insert(0, f"Table {marker}")
+            chunk_text = "\n".join(lines)
             actual_tokens = self.estimate_tokens(chunk_text)
             if actual_tokens > self.HARD_CAP_TOKENS:
                 self.stats["oversized_table_chunks"] += 1
@@ -455,22 +613,12 @@ class MinerUConverter:
                     "limit": self.HARD_CAP_TOKENS,
                     "page_no": page_no,
                 })
-
             chunks.append({
                 "text": chunk_text,
                 "is_split": True,
-                "split_index": chunk_index,
-                "total_splits": None  # 将在后面更新
+                "split_index": index,
+                "total_splits": total_splits,
             })
-
-        # 更新 total_splits
-        total_splits = len(chunks)
-        for c in chunks:
-            c["total_splits"] = total_splits
-            # 修正 Part X/Y 中的 Y
-            if caption and "(Part " in c["text"]:
-                c["text"] = re.sub(r"\(Part \d+/\d+\)", f"(Part {c['split_index']}/{total_splits})", c["text"])
-
         return chunks
 
     def extract_image_info(self, block: dict) -> tuple:
@@ -503,54 +651,74 @@ class MinerUConverter:
         """估算 token 数量"""
         return len(text) // 4
 
+    def _hard_split_text(self, text: str, max_tokens: int) -> list:
+        """Split an indivisible sentence without dropping any non-whitespace text."""
+        max_chars = max(1, max_tokens * 4)
+        parts = []
+        remaining = text.strip()
+        while len(remaining) > max_chars:
+            cut = max_chars
+            lower_bound = max_chars // 2
+            for separator in ("\n", " ", ";", ","):
+                candidate = remaining.rfind(separator, lower_bound, max_chars + 1)
+                if candidate > lower_bound:
+                    cut = candidate + (1 if separator in {";", ","} else 0)
+                    break
+            part = remaining[:cut].strip()
+            if part:
+                parts.append(part)
+            remaining = remaining[cut:].strip()
+        if remaining:
+            parts.append(remaining)
+        return parts
+
     def split_long_text(self, text: str, max_tokens: int = HARD_CAP_TOKENS) -> list:
-        """将长文本按自然边界切分"""
+        """Split long text on natural boundaries with a guaranteed hard cap."""
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be greater than zero")
         if self.estimate_tokens(text) <= max_tokens:
             return [text]
 
-        paragraphs = text.split("\n\n")
-        chunks = []
-        current_chunk = []
-        current_tokens = 0
+        pieces = []
+        for paragraph in text.split("\n\n"):
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+            if self.estimate_tokens(paragraph) <= max_tokens:
+                pieces.append(paragraph)
+                continue
 
-        for para in paragraphs:
-            para_tokens = self.estimate_tokens(para)
-
-            if para_tokens > max_tokens:
-                if current_chunk:
-                    chunks.append("\n\n".join(current_chunk))
-                    current_chunk = []
-                    current_tokens = 0
-
-                sentences = re.split(r'(?<=[.!?。！？])\s+', para)
-                temp_chunk = []
-                temp_tokens = 0
-
-                for sent in sentences:
-                    sent_tokens = self.estimate_tokens(sent)
-                    if temp_tokens + sent_tokens <= max_tokens:
-                        temp_chunk.append(sent)
-                        temp_tokens += sent_tokens
-                    else:
-                        if temp_chunk:
-                            chunks.append(" ".join(temp_chunk))
-                        temp_chunk = [sent]
-                        temp_tokens = sent_tokens
-
-                if temp_chunk:
-                    chunks.append(" ".join(temp_chunk))
-            else:
-                if current_tokens + para_tokens <= max_tokens:
-                    current_chunk.append(para)
-                    current_tokens += para_tokens
+            sentence_group = ""
+            for sentence in re.split(r'(?<=[.!?。！？])\s+', paragraph):
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                if self.estimate_tokens(sentence) > max_tokens:
+                    if sentence_group:
+                        pieces.append(sentence_group)
+                        sentence_group = ""
+                    pieces.extend(self._hard_split_text(sentence, max_tokens))
+                    continue
+                candidate = f"{sentence_group} {sentence}".strip()
+                if sentence_group and self.estimate_tokens(candidate) > max_tokens:
+                    pieces.append(sentence_group)
+                    sentence_group = sentence
                 else:
-                    chunks.append("\n\n".join(current_chunk))
-                    current_chunk = [para]
-                    current_tokens = para_tokens
+                    sentence_group = candidate
+            if sentence_group:
+                pieces.append(sentence_group)
 
-        if current_chunk:
-            chunks.append("\n\n".join(current_chunk))
-
+        chunks = []
+        current = ""
+        for piece in pieces:
+            candidate = f"{current}\n\n{piece}".strip()
+            if current and self.estimate_tokens(candidate) > max_tokens:
+                chunks.append(current)
+                current = piece
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
         return chunks
 
     def merge_short_text_blocks(self, blocks: list) -> list:
@@ -564,6 +732,17 @@ class MinerUConverter:
 
         for block in blocks:
             block_tokens = self.estimate_tokens(block.get("text", ""))
+
+            if current_group:
+                first = current_group[0]
+                same_context = (
+                    first.get("page_no") == block.get("page_no")
+                    and first.get("section_title", "") == block.get("section_title", "")
+                )
+                if not same_context:
+                    merged.append(self._merge_block_group(current_group))
+                    current_group = []
+                    current_tokens = 0
 
             if block_tokens < self.TARGET_TOKENS_MIN:
                 if current_tokens + block_tokens <= self.TARGET_TOKENS_MAX:
@@ -707,8 +886,11 @@ class MinerUConverter:
                 text = ""
 
                 if block_type == "title":
-                    title_text = self.extract_title_text(block)
-                    level = block.get("content", {}).get("level", 1)
+                    title_text = self.clean_section_title(self.extract_title_text(block))
+                    try:
+                        level = max(1, int(block.get("content", {}).get("level", 1)))
+                    except (TypeError, ValueError):
+                        level = 1
                     while len(section_path) >= level:
                         section_path.pop()
                     section_path.append(title_text)
@@ -730,12 +912,20 @@ class MinerUConverter:
         # 首先构建块位置缓存
         self.build_page_blocks_cache(content_data)
 
-        page_no = 0
         block_index = 0
         text_buffer = []
 
-        for page_blocks in content_data:
-            page_no += 1
+        def flush_text_buffer():
+            nonlocal text_buffer
+            if not text_buffer:
+                return
+            for item in self.merge_short_text_blocks(text_buffer):
+                self._add_text_chunk(item)
+            text_buffer = []
+
+        for page_no, page_blocks in enumerate(content_data, 1):
+            # A chunk has exactly one page_no; never carry buffered text across pages.
+            flush_text_buffer()
 
             for block_idx, block in enumerate(page_blocks):
                 block_index += 1
@@ -744,8 +934,12 @@ class MinerUConverter:
 
                 # 更新章节标题
                 if block_type == "title":
-                    title_text = self.extract_title_text(block)
-                    level = block.get("content", {}).get("level", 1)
+                    flush_text_buffer()
+                    title_text = self.clean_section_title(self.extract_title_text(block))
+                    try:
+                        level = max(1, int(block.get("content", {}).get("level", 1)))
+                    except (TypeError, ValueError):
+                        level = 1
 
                     while len(self.section_path) >= level:
                         self.section_path.pop()
@@ -753,8 +947,14 @@ class MinerUConverter:
                     self.current_section_title = " > ".join(self.section_path)
                     self.last_formal_figure = None
 
-                    # 检查是否是低价值章节（目录、索引、修订历史）
-                    self.skip_current_section = self._should_skip_section(title_text)
+                    # Keep skipping descendants of a low-value section until a
+                    # sibling/ancestor title starts. A new low-value sibling keeps
+                    # the filter active (e.g. Contents -> Figures -> Tables).
+                    if self.skip_section_level is not None and level <= self.skip_section_level:
+                        self.skip_section_level = None
+                    if self._should_skip_section(title_text):
+                        self.skip_section_level = level
+                    self.skip_current_section = self.skip_section_level is not None
                     if self.skip_current_section:
                         self.stats["skipped_low_value_sections"] += 1
                         self.error_report["skipped_blocks"].append({
@@ -775,7 +975,7 @@ class MinerUConverter:
                     continue
 
                 # 跳过噪音类型（包括页边文本）
-                if block_type in ["page_header", "page_footer", "page_number", "header", "footer", "page_aside_text"]:
+                if self.TYPE_MAPPING.get(block_type) == "noise":
                     if block_type == "page_aside_text":
                         self.stats["aside_noise"] += 1
                     else:
@@ -789,7 +989,8 @@ class MinerUConverter:
                     continue
 
                 # 跳过低价值章节中的内容
-                if self.skip_current_section and block_type in ["paragraph", "list", "table", "code"]:
+                if self.skip_current_section:
+                    flush_text_buffer()
                     self.error_report["skipped_blocks"].append({
                         "block_id": f"p{page_no}_b{block_index}",
                         "type": block_type,
@@ -809,6 +1010,13 @@ class MinerUConverter:
                     text = self.clean_text(text)
 
                     if not text or len(text.strip()) < 10:
+                        self.stats["skipped_empty"] += 1
+                        self.error_report["skipped_blocks"].append({
+                            "block_id": f"p{page_no}_b{block_index}",
+                            "type": block_type,
+                            "reason": "empty or too-short text block",
+                            "page_no": page_no,
+                        })
                         continue
 
                     text_buffer.append({
@@ -822,11 +1030,29 @@ class MinerUConverter:
                     continue
 
                 # 先处理缓冲区中的文本
-                if text_buffer:
-                    merged = self.merge_short_text_blocks(text_buffer)
-                    for item in merged:
-                        self._add_text_chunk(item)
-                    text_buffer = []
+                flush_text_buffer()
+
+                if block_type == "page_footnote":
+                    text = self.clean_text(self.extract_page_footnote_text(block))
+                    if not text:
+                        self.stats["skipped_empty"] += 1
+                        self.error_report["skipped_blocks"].append({
+                            "block_id": f"p{page_no}_b{block_index}",
+                            "type": block_type,
+                            "reason": "empty page footnote",
+                            "page_no": page_no,
+                        })
+                        continue
+                    self._add_text_chunk({
+                        "type": "text",
+                        "text": f"Footnote: {text}",
+                        "page_no": page_no,
+                        "section_title": self.current_section_title,
+                        "source_block_id": f"p{page_no}_b{block_index}",
+                        "bbox": bbox,
+                        "source_type": "page_footnote",
+                    })
+                    continue
 
                 # 处理表格
                 if block_type == "table":
@@ -857,10 +1083,7 @@ class MinerUConverter:
                 })
 
         # 处理剩余的文本缓冲
-        if text_buffer:
-            merged = self.merge_short_text_blocks(text_buffer)
-            for item in merged:
-                self._add_text_chunk(item)
+        flush_text_buffer()
 
     def _add_text_chunk(self, item: dict):
         """添加文本 chunk"""
@@ -913,20 +1136,18 @@ class MinerUConverter:
         image_source = content.get("image_source", {})
         image_path_raw = image_source.get("path", "")
 
-        full_image_path = None
+        # MinerU may emit an otherwise empty table with the directory placeholder
+        # ``images/``. It is not a missing file reference. A real file-like path
+        # becomes mandatory only when the table has no textual representation.
+        has_textual_content = bool(headers or rows or caption or footnote)
         relative_image_path = ""
-
-        if image_path_raw and self._is_valid_image_path(image_path_raw):
-            full_image_path = self.input_dir / image_path_raw
-            if full_image_path.exists():
-                relative_image_path = self._get_relative_path(full_image_path)
-            else:
-                self.error_report["missing_images"].append({
-                    "block_id": f"p{page_no}_b{block_index}",
-                    "expected_path": str(image_path_raw),
-                    "type": "table",
-                })
-                self.stats["missing_images"] += 1
+        if self._is_valid_image_path(image_path_raw):
+            relative_image_path = self._resolve_image_path(
+                image_path_raw,
+                f"p{page_no}_b{block_index}",
+                "table",
+                required=not has_textual_content,
+            )
 
         # 如果没有内容，跳过
         if not headers and not rows and not relative_image_path:
@@ -983,24 +1204,16 @@ class MinerUConverter:
             self.stats["total_chunks"] += 1
 
     def _process_image_block(self, block: dict, page_no: int, block_idx: int, block_index: int):
-        """处理图片块 - 支持正式图、子图碎片、弱图块的分级处理"""
+        """Preserve every image/chart as its own addressable figure chunk."""
         image_path_raw, image_text, caption_text = self.extract_image_info(block)
         source_type = block.get("type", "image")
 
-        full_image_path = None
-        relative_image_path = ""
-
-        if image_path_raw and self._is_valid_image_path(image_path_raw):
-            full_image_path = self.input_dir / image_path_raw
-            if full_image_path.exists():
-                relative_image_path = self._get_relative_path(full_image_path)
-            else:
-                self.error_report["missing_images"].append({
-                    "block_id": f"p{page_no}_b{block_index}",
-                    "expected_path": str(image_path_raw),
-                    "type": source_type,
-                })
-                self.stats["missing_images"] += 1
+        relative_image_path = self._resolve_image_path(
+            image_path_raw,
+            f"p{page_no}_b{block_index}",
+            source_type,
+            required=True,
+        )
 
         section_title = self.current_section_title
 
@@ -1015,62 +1228,6 @@ class MinerUConverter:
 
         chunk_text = "\n".join(texts) if texts else "Figure (see image)"
 
-        # 对 figure chunk 进行分类
-        if source_type == "chart" and relative_image_path:
-            # MinerU may split one chart into several image blocks while keeping
-            # the full caption in a neighboring title block. Every chart image
-            # is meaningful even when its own caption is short or empty.
-            figure_type = "formal"
-        else:
-            figure_type = self._classify_figure_chunk(
-                caption_text, nearby_text, chunk_text
-            )
-
-        # 1. 弱图块：直接跳过
-        if figure_type == 'weak':
-            self.stats["skipped_weak_figures"] += 1
-            self.error_report["skipped_blocks"].append({
-                "block_id": f"p{page_no}_b{block_index}",
-                "type": source_type,
-                "reason": "weak figure chunk skipped (insufficient caption or context)",
-                "page_no": page_no,
-                "caption": caption_text[:100] if caption_text else "",
-                "nearby_text_preview": nearby_text[:100] if nearby_text else "",
-            })
-            return
-
-        # 2. 子图碎片：合并到最近的主图
-        if figure_type == 'subfigure':
-            if self._can_merge_into_last_figure(page_no, section_title):
-                # 合并到最近的主图
-                last_idx = self.last_formal_figure['index']
-                # 更新主图的 chunk_text，添加子图信息
-                subfigure_info = f"[Subfigure: {caption_text}]"
-                if relative_image_path:
-                    subfigure_info += f" (Image: {relative_image_path})"
-
-                self.chunks[last_idx]['chunk_text'] += f"\n{subfigure_info}"
-                self.chunks[last_idx]['metadata']['cleanup_flags'].append('merged_subfigure')
-                self.chunks[last_idx]['metadata'].setdefault('subfigures', []).append({
-                    'caption': caption_text,
-                    'image_path': relative_image_path,
-                    'page_no': page_no,
-                })
-                self.stats["subfigure_fragments_merged"] += 1
-                return
-            else:
-                # 没有找到主图，当作弱图块跳过
-                self.stats["skipped_weak_figures"] += 1
-                self.error_report["skipped_blocks"].append({
-                    "block_id": f"p{page_no}_b{block_index}",
-                    "type": source_type,
-                    "reason": "subfigure fragment skipped (no parent figure found)",
-                    "page_no": page_no,
-                    "caption": caption_text[:100] if caption_text else "",
-                })
-                return
-
-        # 3. 正式图：创建 chunk 并缓存
         chunk_id = f"{self.doc_id}:p{page_no}:figure:{len(self.chunks) + 1}"
 
         section_path = section_title.split(" > ") if section_title else []
@@ -1080,7 +1237,9 @@ class MinerUConverter:
             "figure_title": caption_text,
             "nearby_text": nearby_text,
             "block_bbox": block.get("bbox", []),
-            "cleanup_flags": [],
+            "cleanup_flags": [
+                "limited_figure_context"
+            ] if not caption_text and not nearby_text else [],
             "parser": "MinerU-postprocessed",
         }
 
@@ -1096,14 +1255,6 @@ class MinerUConverter:
             "image_path": relative_image_path,
             "source_block_id": f"p{page_no}_b{block_index}",
             "metadata": metadata,
-        }
-
-        # 缓存这个正式图的索引
-        self.last_formal_figure = {
-            'index': len(self.chunks),
-            'chunk_id': chunk_id,
-            'page_no': page_no,
-            'section_title': section_title,
         }
 
         self.chunks.append(chunk)
@@ -1182,66 +1333,19 @@ class MinerUConverter:
         self.stats["total_chunks"] += 1
 
     def clean_text(self, text: str) -> str:
-        """清洗文本"""
+        """Normalize whitespace without deleting technical or legal content."""
         if not text:
             return ""
-
-        text = re.sub(r' +', ' ', text)
-        text = re.sub(r'\n\s*\d+\s*\n', '\n', text)
-        text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
-        text = re.sub(r'<[^>]+>', '', text)
-
-        watermarks = [
-            r'www\.[a-zA-Z0-9.-]+\.(com|cn|net|org)',
-            r'Copyright\s*©?\s*\d{4}.*',
-            r'All\s+rights\s+reserved',
-        ]
-        for pattern in watermarks:
-            text = re.sub(pattern, '', text, flags=re.IGNORECASE)
-
+        text = str(text).replace("\r\n", "\n").replace("\r", "\n")
+        text = text.replace("\u00a0", " ")
+        text = re.sub(r'[ \t]+', ' ', text)
+        text = re.sub(r' *\n *', '\n', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
         return text.strip()
 
     def deduplicate_headers_footers(self):
-        """删除高频重复的页眉页脚"""
-        prefix_counter = defaultdict(int)
-        suffix_counter = defaultdict(int)
-
-        for chunk in self.chunks:
-            if (
-                chunk["content_type"] == "text"
-                and chunk.get("metadata", {}).get("source_type") != "code"
-            ):
-                text = chunk["chunk_text"]
-                prefix = text[:50].strip()
-                suffix = text[-50:].strip()
-                if len(prefix) > 20:
-                    prefix_counter[prefix] += 1
-                if len(suffix) > 20:
-                    suffix_counter[suffix] += 1
-
-        common_prefixes = {p for p, c in prefix_counter.items() if c > 3}
-        common_suffixes = {s for s, c in suffix_counter.items() if c > 3}
-
-        for chunk in self.chunks:
-            if (
-                chunk["content_type"] == "text"
-                and chunk.get("metadata", {}).get("source_type") != "code"
-            ):
-                text = chunk["chunk_text"]
-
-                for prefix in common_prefixes:
-                    if text.startswith(prefix):
-                        text = text[len(prefix):].strip()
-                        chunk["metadata"]["cleanup_flags"].append("removed_header")
-                        break
-
-                for suffix in common_suffixes:
-                    if text.endswith(suffix):
-                        text = text[:-len(suffix)].strip()
-                        chunk["metadata"]["cleanup_flags"].append("removed_footer")
-                        break
-
-                chunk["chunk_text"] = text
+        """No-op: page furniture is filtered by MinerU block type, never by text."""
+        return None
 
     def clean_section_title(self, title: str) -> str:
         """清洗章节标题：去除首尾空格，压缩连续空白"""
@@ -1335,47 +1439,55 @@ class MinerUConverter:
         classification = self._classify_figure_chunk(caption_text, nearby_text, chunk_text)
         return classification == 'weak'
 
+    @staticmethod
+    def _atomic_write_text(path: Path, content: str) -> None:
+        """Atomically replace one output file in its destination directory."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=str(path.parent),
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(str(temporary), str(path))
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    def _serialize_jsonl(self) -> str:
+        lines = []
+        for chunk in self.chunks:
+            minimal_chunk = {
+                "chunk_id": chunk["chunk_id"],
+                "page_no": chunk["page_no"],
+                "content_type": chunk["content_type"],
+                "section_title": self.clean_section_title(chunk["section_title"]),
+                "chunk_text": chunk["chunk_text"],
+                "image_path": chunk["image_path"],
+            }
+            lines.append(json.dumps(minimal_chunk, ensure_ascii=False))
+        return "\n".join(lines) + "\n"
+
     def write_jsonl(self):
         """写入 JSONL 文件 - 精简版，适合知识库 / RAG 入库"""
         jsonl_path = self.output_dir / "kb_chunks.jsonl"
-
-        with open(jsonl_path, "w", encoding="utf-8") as f:
-            for chunk in self.chunks:
-                # 清洗 section_title
-                section_title = self.clean_section_title(chunk["section_title"])
-
-                # 只保留入库必需的字段
-                minimal_chunk = {
-                    "chunk_id": chunk["chunk_id"],
-                    "page_no": chunk["page_no"],
-                    "content_type": chunk["content_type"],
-                    "section_title": section_title,
-                    "chunk_text": chunk["chunk_text"],
-                    "image_path": chunk["image_path"],
-                }
-                f.write(json.dumps(minimal_chunk, ensure_ascii=False) + "\n")
-
+        self._atomic_write_text(jsonl_path, self._serialize_jsonl())
         print(f"已生成: {jsonl_path}")
-
-        # 写入共享输出目录（以文档名命名）
-        if self.shared_output_dir:
-            self.shared_output_dir.mkdir(parents=True, exist_ok=True)
-            shared_path = self.shared_output_dir / f"{self.doc_title}.jsonl"
-            with open(shared_path, "w", encoding="utf-8") as f:
-                for chunk in self.chunks:
-                    section_title = self.clean_section_title(chunk["section_title"])
-                    minimal_chunk = {
-                        "chunk_id": chunk["chunk_id"],
-                        "page_no": chunk["page_no"],
-                        "content_type": chunk["content_type"],
-                        "section_title": section_title,
-                        "chunk_text": chunk["chunk_text"],
-                        "image_path": chunk["image_path"],
-                    }
-                    f.write(json.dumps(minimal_chunk, ensure_ascii=False) + "\n")
-            print(f"已生成 (共享): {shared_path}")
-
         return jsonl_path
+
+    def write_shared_jsonl(self):
+        """Publish shared JSONL only after every local output validates and writes."""
+        if self.shared_output_dir:
+            shared_path = self.shared_output_dir / f"{self.doc_title}.jsonl"
+            self._atomic_write_text(shared_path, self._serialize_jsonl())
+            print(f"已生成 (共享): {shared_path}")
+            return shared_path
+        return None
 
     def write_manifest(self):
         """写入 manifest 文件 - 记录存在的文件和使用的文件"""
@@ -1399,7 +1511,8 @@ class MinerUConverter:
                 "target_tokens": f"{self.TARGET_TOKENS_MIN}-{self.TARGET_TOKENS_MAX}",
                 "hard_cap": self.HARD_CAP_TOKENS,
                 "merge_short_blocks": True,
-                "deduplicate_headers": True,
+                "deduplicate_headers": False,
+                "page_furniture_filter": "MinerU structural block types only",
                 "table_split": True,
                 "type_mapping": self.TYPE_MAPPING,
             },
@@ -1407,8 +1520,10 @@ class MinerUConverter:
         }
 
         manifest_path = self.output_dir / "kb_manifest.json"
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        self._atomic_write_text(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        )
 
         print(f"已生成: {manifest_path}")
         return manifest_path
@@ -1420,11 +1535,16 @@ class MinerUConverter:
             "total_skipped_blocks": len(self.error_report["skipped_blocks"]),
             "total_unsupported_blocks": len(self.error_report["unsupported_blocks"]),
             "total_parse_errors": len(self.error_report["parse_errors"]),
+            "total_oversized_table_chunks": len(
+                self.error_report.get("oversized_table_chunks", [])
+            ),
         }
 
         error_path = self.output_dir / "error_report.json"
-        with open(error_path, "w", encoding="utf-8") as f:
-            json.dump(self.error_report, f, ensure_ascii=False, indent=2)
+        self._atomic_write_text(
+            error_path,
+            json.dumps(self.error_report, ensure_ascii=False, indent=2) + "\n",
+        )
 
         print(f"已生成: {error_path}")
         return error_path
@@ -1486,6 +1606,7 @@ class MinerUConverter:
 | `chart` | `figure` | 图表，保留图片、标题和图注 |
 | `code` | `text` | 代码或时序文本，原文保留为可检索文本 |
 | `equation_interline` | `formula` | 行间公式 |
+| `page_footnote` | `text` | 保留语义脚注和引用，不当作页边噪声 |
 | `title` | - | 用于章节追踪，不输出 |
 | `page_header/footer/number` | - | 当作噪音跳过 |
 
@@ -1493,14 +1614,14 @@ class MinerUConverter:
 
 - **目标长度**: 300-700 tokens
 - **上限**: 900 tokens（硬切分）
-- **合并**: 相邻同章节短正文块自动合并
+- **合并**: 仅合并同页、同章节的相邻短正文块
 - **切分**: 超长文本按自然段或句子切分
 
 ### 表格 Chunk 规则
 
 - **默认**: 一张表一个 chunk
-- **拆分**: 超长表格按行拆分，每个子 chunk 重复表标题和表头
-- **格式**: 表格 HTML 转换为自然语言/键值文本
+- **拆分**: 超长表格按行拆分；单行过宽时无截断续分，每个子 chunk 重复表标题和表头
+- **格式**: 使用 HTML parser 保留带属性的单元格，并显式记录 `rowspan`/`colspan`
 
 ### 图片 Chunk 规则
 
@@ -1511,9 +1632,8 @@ class MinerUConverter:
 
 ### 清洗规则
 
-- 删除高频重复页眉页脚
-- 删除孤立页码、无意义空行
-- 删除 HTML 残片
+- 仅按 MinerU 的结构化页眉、页脚、页码块过滤页面装饰
+- 规范化空白和空行，不按重复文本猜测页眉页脚
 - 保留技术术语、型号、单位、符号原样
 
 ## RAG / Knowledge Base Ingestion Guide
@@ -1553,7 +1673,7 @@ metadata_fields: [chunk_id, page_no, content_type, section_title, image_path]
 ## 注意事项
 
 1. 所有路径字段使用相对于项目根目录的格式，统一用 `/` 分隔
-2. `image_path` 为空字符串表示无图或图片缺失
+2. `image_path` 为空字符串表示非图像 chunk；图像源缺失会使转换失败
 3. 公式以 LaTeX 格式保留原始数学含义
 4. 表格已转换为可读文本格式，支持超长表格拆分
 5. `section_title` 与 `metadata.section_path` 保持一致
@@ -1561,11 +1681,58 @@ metadata_fields: [chunk_id, page_no, content_type, section_title, image_path]
 """
 
         readme_path = self.output_dir / "README_kb.md"
-        with open(readme_path, "w", encoding="utf-8") as f:
-            f.write(readme_content)
+        self._atomic_write_text(readme_path, readme_content)
 
         print(f"已生成: {readme_path}")
         return readme_path
+
+    def validate_conversion(self) -> list:
+        """Validate the in-memory package before publishing any JSONL."""
+        issues = []
+        if not self.chunks:
+            issues.append("no knowledge-base chunks were generated")
+
+        allowed_types = {"text", "table", "figure", "formula"}
+        chunk_ids = set()
+        for index, chunk in enumerate(self.chunks, 1):
+            chunk_id = str(chunk.get("chunk_id") or "")
+            if not chunk_id:
+                issues.append(f"chunk {index} has no chunk_id")
+            elif chunk_id in chunk_ids:
+                issues.append(f"duplicate chunk_id: {chunk_id}")
+            chunk_ids.add(chunk_id)
+
+            if chunk.get("content_type") not in allowed_types:
+                issues.append(f"{chunk_id or index}: invalid content_type")
+            text = str(chunk.get("chunk_text") or "")
+            if not text.strip():
+                issues.append(f"{chunk_id or index}: empty chunk_text")
+            if self.estimate_tokens(text) > self.HARD_CAP_TOKENS:
+                issues.append(f"{chunk_id or index}: exceeds hard token cap")
+
+            image_path = str(chunk.get("image_path") or "")
+            if image_path:
+                image = Path(image_path)
+                if not image.is_absolute():
+                    image = self.project_root / image
+                if not image.is_file():
+                    issues.append(f"{chunk_id or index}: missing image {image_path}")
+
+        if len(self.chunks) != self.stats["total_chunks"]:
+            issues.append("chunk count does not match manifest statistics")
+        if self.error_report["missing_images"]:
+            issues.append(f"{len(self.error_report['missing_images'])} missing image(s)")
+        if self.error_report["unsupported_blocks"]:
+            issues.append(
+                f"{len(self.error_report['unsupported_blocks'])} unsupported block(s)"
+            )
+        if self.error_report["parse_errors"]:
+            issues.append(f"{len(self.error_report['parse_errors'])} parse error(s)")
+        if self.error_report.get("oversized_table_chunks"):
+            issues.append(
+                f"{len(self.error_report['oversized_table_chunks'])} oversized table chunk(s)"
+            )
+        return issues
 
     def convert(self):
         """执行完整转换流程"""
@@ -1575,11 +1742,11 @@ metadata_fields: [chunk_id, page_no, content_type, section_title, image_path]
 
         # 1. 发现文件
         files_exist, files_used = self.discover_files()
-        print(f"发现文件 (存在):")
+        print("发现文件 (存在):")
         for k, v in files_exist.items():
             status = "✓" if v else "✗"
             print(f"  [{status}] {k}: {v.name if v else 'N/A'}")
-        print(f"\n实际使用:")
+        print("\n实际使用:")
         for k, v in files_used.items():
             if v:
                 print(f"  [→] {k}: {v.name}")
@@ -1587,10 +1754,13 @@ metadata_fields: [chunk_id, page_no, content_type, section_title, image_path]
 
         # 检查必要文件
         if not files_used.get("content_list_v2") and not files_used.get("content_list"):
-            raise ValueError("未找到 content_list_v2.json 或 content_list.json")
+            self.error_report["parse_errors"].append({
+                "file": str(self.input_dir),
+                "error": "content_list_v2.json or content_list.json not found",
+            })
 
         # 2. 加载内容
-        content_data = self.load_content()
+        content_data = self.load_content() if files_used else []
         print(f"共 {len(content_data)} 页")
 
         # 3. 处理块
@@ -1602,14 +1772,21 @@ metadata_fields: [chunk_id, page_no, content_type, section_title, image_path]
         # 5. 创建输出目录
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # 6. 写入文件
+        # 6. Validate before publishing local/shared JSONL. Always keep an
+        # error report for a failed direct converter invocation.
+        validation_issues = self.validate_conversion()
+        self.write_error_report()
+        if validation_issues:
+            raise ConverterError("; ".join(validation_issues))
+
+        # 7. Write local files atomically, then publish shared JSONL last.
         self.write_jsonl()
         self.write_manifest()
-        self.write_error_report()
         self.write_readme()
+        self.write_shared_jsonl()
 
         print("-" * 50)
-        print(f"转换完成!")
+        print("转换完成!")
         print(f"总 Chunks: {self.stats['total_chunks']}")
         print(f"  - 文本: {self.stats['text_chunks']}")
         print(f"  - 表格: {self.stats['table_chunks']}")
@@ -1649,10 +1826,15 @@ def main():
 
     args = parser.parse_args()
 
-    converter = MinerUConverter(args.input_dir, args.output_dir,
-                                shared_output_dir=args.shared_output)
-    converter.convert()
+    try:
+        converter = MinerUConverter(args.input_dir, args.output_dir,
+                                    shared_output_dir=args.shared_output)
+        converter.convert()
+    except (ConverterError, OSError, ValueError) as exc:
+        print(f"转换失败: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

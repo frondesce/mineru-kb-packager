@@ -39,6 +39,17 @@ python3 <skill-dir>/acquire_mineru.py /path/to/pdfs \
 
 Read the Token only from `MINERU_TOKEN`. Require a fresh target directory; if the computed target already exists, report the conflict and stop.
 
+After a successful MinerU acquisition whose conversion failed, reuse the existing structured results without another upload. To reconvert every `*-mineru` directory under one result root, omit the original PDF inputs:
+
+```bash
+python3 <skill-dir>/acquire_mineru.py \
+  --output-root /path/to/knowledge-base \
+  --shared-output /path/to/knowledge-base/output \
+  --convert-only
+```
+
+`--convert-only` does not require `MINERU_TOKEN`. With PDF inputs it checks their computed `*-mineru` directories; without PDF inputs it scans `--output-root`. Every selected result must contain one valid `*_content_list_v2.json`.
+
 ## Parsing options
 
 Use `vlm` with table and formula recognition enabled by default.
@@ -75,7 +86,7 @@ Report completion only after every successful document has:
 - a non-empty `output/kb_chunks.jsonl` with no empty `chunk_text`;
 - `output/kb_manifest.json` and `output/error_report.json`;
 - valid files for every non-empty `image_path`.
-- no unsupported MinerU block types or converter parse errors.
+- no missing image sources, unsupported MinerU block types, converter parse errors, or oversized chunks.
 
 Report successful and failed document counts and the final JSONL paths.
 
@@ -83,8 +94,10 @@ Report successful and failed document counts and the final JSONL paths.
 
 - Prefer `content_list_v2.json`; never use `full.md` as structured input.
 - Emit only `chunk_id`, `page_no`, `content_type`, `section_title`, `chunk_text`, and `image_path` in JSONL.
-- Filter empty blocks, page furniture, contents pages, and revision-history sections.
-- Split long tables by row and repeat their title and headers; do not truncate cells.
+- Filter empty blocks, structurally identified page furniture, contents pages, and revision-history sections.
+- Preserve semantic `page_footnote` blocks as searchable text; never classify them as page furniture solely from their type.
+- Merge text only within the same page and section.
+- Parse table HTML with attribute-aware handling for `rowspan` and `colspan`. Split long tables by row, repeat their title and headers, and never truncate cell text.
 - Resolve image paths relative to the knowledge-base root and use adjacent body text as figure context.
-- Preserve MinerU `chart` blocks as figures and `code` blocks as searchable text.
+- Preserve every MinerU `image`/`chart` block as an independently addressable figure and every `code` block as searchable text.
 - Strip and normalize whitespace in `section_title`.
